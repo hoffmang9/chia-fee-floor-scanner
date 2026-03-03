@@ -7,9 +7,11 @@ This script performs a two-phase scan over a lookback window:
    total block fee).
 2) Spend-level inspection with `/get_block_spends_with_conditions`.
 
-Strict exclusion policy:
-- If any spend in a candidate block has zero fee, that entire block is excluded.
-- For each remaining block, record the minimum per-spend fee.
+Current output metric:
+- For each qualifying block, estimate a naive fee-per-transaction proxy as:
+  block_total_fee / spend_count
+- Here, spend_count is the number of `block_spends_with_conditions` entries in
+  the block (a practical proxy, not exact spend-bundle count).
 
 Per-spend fee estimator:
   coin_spend.coin.amount - sum(CREATE_COIN output amounts)
@@ -24,6 +26,8 @@ Output CSV columns:
 - block_height
 - min_spend_fee_mojo
 - spend_count
+- block_total_fee_mojo
+- estimated_fee_per_tx_mojo
 """
 
 from __future__ import annotations
@@ -48,6 +52,8 @@ DEFAULT_DAYS = 1.0
 DEFAULT_CHUNK_SIZE = 400
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_WORKERS = 8
+DEFAULT_NEGATIVE_CACHE_PATH = ".cache/non_qualifying_blocks.json"
+DEFAULT_MIN_ESTIMATED_FEE_PER_TX_MOJO = 1000
 MOJO_PER_XCH = 1_000_000_000_000
 PROGRESS_DOT_INTERVAL_SECONDS = 10.0
 
@@ -56,6 +62,7 @@ PROGRESS_DOT_INTERVAL_SECONDS = 10.0
 class CandidateBlock:
     height: int
     header_hash: str | None
+    total_block_fee_mojo: int = 0
 
 
 @dataclass
@@ -63,13 +70,14 @@ class BlockFeeRow:
     height: int
     min_spend_fee_mojo: int
     spend_count: int
+    block_total_fee_mojo: int = 0
+    estimated_fee_per_tx_mojo: float = 0.0
 
 
 @dataclass
 class SkippedBlockRow:
     height: int
     reason: str
-
 
 class ProgressDotTicker:
     """Print a dot at start, then every interval seconds until stopped."""
@@ -139,12 +147,102 @@ def post_json(base_url: str, endpoint: str, payload: dict[str, Any], timeout: in
 
 
 def iter_height_ranges(start: int, end: int, chunk_size: int) -> Iterable[tuple[int, int]]:
-    """Yield inclusive [start, end] ranges for chunked block queries."""
+    """Yield half-open [start, end) ranges for chunked block queries."""
     current = start
-    while current <= end:
-        chunk_end = min(current + chunk_size - 1, end)
+    while current < end:
+        chunk_end = min(current + chunk_size, end)
         yield current, chunk_end
-        current = chunk_end + 1
+        current = chunk_end
+
+
+def iter_uncached_height_ranges(
+    start: int,
+    end: int,
+    chunk_size: int,
+    excluded_heights: set[int],
+) -> Iterable[tuple[int, int]]:
+    """Yield [start, end) ranges excluding explicitly cached heights."""
+    if not excluded_heights:
+        yield from iter_height_ranges(start, end, chunk_size)
+        return
+
+    excluded = sorted(h for h in excluded_heights if start <= h < end)
+    current = start
+    for height in excluded:
+        if current < height:
+            yield from iter_height_ranges(current, height, chunk_size)
+        current = max(current, height + 1)
+    if current < end:
+        yield from iter_height_ranges(current, end, chunk_size)
+
+
+def load_phase1_cache(cache_path: Path, base_url: str) -> dict[int, dict[str, Any]]:
+    if not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    by_base_url = data.get("by_base_url", {}) if isinstance(data, dict) else {}
+    base_entry = by_base_url.get(base_url, {}) if isinstance(by_base_url, dict) else {}
+    by_height = base_entry.get("phase1_by_height", {})
+    result: dict[int, dict[str, Any]] = {}
+    if not isinstance(by_height, dict):
+        return result
+    for key, value in by_height.items():
+        try:
+            parsed = int(key)
+        except (TypeError, ValueError):
+            continue
+        if parsed < 0 or not isinstance(value, dict):
+            continue
+        candidate = bool(value.get("candidate", False))
+        header_hash = value.get("header_hash")
+        if not isinstance(header_hash, str):
+            header_hash = None
+        try:
+            total_fee = int(value.get("total_block_fee_mojo", 0))
+        except (TypeError, ValueError):
+            total_fee = 0
+        result[parsed] = {
+            "candidate": candidate,
+            "header_hash": header_hash,
+            "total_block_fee_mojo": total_fee,
+        }
+    return result
+
+
+def save_phase1_cache(cache_path: Path, base_url: str, phase1_by_height: dict[int, dict[str, Any]]) -> None:
+    data: dict[str, Any]
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    else:
+        data = {}
+
+    by_base_url = data.get("by_base_url")
+    if not isinstance(by_base_url, dict):
+        by_base_url = {}
+    data["by_base_url"] = by_base_url
+    serialized: dict[str, Any] = {}
+    for height, entry in phase1_by_height.items():
+        if height < 0:
+            continue
+        serialized[str(int(height))] = {
+            "candidate": bool(entry.get("candidate", False)),
+            "header_hash": entry.get("header_hash") if isinstance(entry.get("header_hash"), str) else None,
+            "total_block_fee_mojo": int(entry.get("total_block_fee_mojo", 0)),
+        }
+    by_base_url[base_url] = {
+        "phase1_by_height": serialized,
+    }
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def get_peak_and_avg_block_time(base_url: str, timeout: int) -> tuple[int, float]:
@@ -273,6 +371,9 @@ def inspect_block_spends(
     base_url: str,
     timeout: int,
     candidate: CandidateBlock,
+    min_spends_per_block: int | None = None,
+    max_spends_per_block: int | None = None,
+    min_estimated_fee_per_tx_mojo: int = DEFAULT_MIN_ESTIMATED_FEE_PER_TX_MOJO,
 ) -> BlockFeeRow | None:
     header_hash = candidate.header_hash or resolve_header_hash_by_height(
         base_url=base_url,
@@ -290,22 +391,39 @@ def inspect_block_spends(
     spends = data.get("block_spends_with_conditions", [])
     if not isinstance(spends, list) or not spends:
         return None
+    if min_spends_per_block is not None and len(spends) < min_spends_per_block:
+        return None
+    if max_spends_per_block is not None and len(spends) > max_spends_per_block:
+        return None
 
     fees: list[int] = []
+    positive_fees: list[int] = []
     for spend in spends:
         fee = spend_fee_mojo(spend)
-        if fee == 0:
-            # Exclude entire block if any spend has zero fee.
-            return None
         fees.append(fee)
+        if fee > 0:
+            positive_fees.append(fee)
 
-    if not fees:
+    if not fees or not positive_fees:
+        return None
+
+    # Sanity check: aggregate spend deltas should reconstruct block-level fee.
+    # If not, skip block rather than publishing inconsistent metrics.
+    block_fee_from_spends = sum(fees)
+    if block_fee_from_spends <= 0:
+        return None
+    if candidate.total_block_fee_mojo > 0 and block_fee_from_spends != candidate.total_block_fee_mojo:
+        return None
+    estimated_fee_per_tx_mojo = candidate.total_block_fee_mojo / len(spends)
+    if estimated_fee_per_tx_mojo < min_estimated_fee_per_tx_mojo:
         return None
 
     return BlockFeeRow(
         height=candidate.height,
-        min_spend_fee_mojo=min(fees),
+        min_spend_fee_mojo=min(positive_fees),
         spend_count=len(fees),
+        block_total_fee_mojo=candidate.total_block_fee_mojo,
+        estimated_fee_per_tx_mojo=estimated_fee_per_tx_mojo,
     )
 
 
@@ -315,15 +433,36 @@ def collect_candidate_blocks(
     chunk_size: int,
     timeout: int,
     sleep_between_chunks: float,
-) -> tuple[list[CandidateBlock], int, int]:
+    phase1_cache_by_height: dict[int, dict[str, Any]] | None = None,
+) -> tuple[list[CandidateBlock], int, int, dict[int, dict[str, Any]], int]:
     # Phase 1: broad scan by height, keep only likely fee-carrying tx blocks.
     peak_height, avg_block_time = get_peak_and_avg_block_time(base_url, timeout)
     lookback_blocks = max(1, math.ceil((days * 86400.0) / avg_block_time))
     start_height = max(0, peak_height - lookback_blocks)
+    end_height_exclusive = peak_height + 1
+    phase1_cache_by_height = dict(phase1_cache_by_height or {})
+    cached_in_window = {
+        h: v for h, v in phase1_cache_by_height.items() if start_height <= h < end_height_exclusive
+    }
+    cached_heights_in_window = set(cached_in_window.keys())
 
     candidates: list[CandidateBlock] = []
+    for height, entry in sorted(cached_in_window.items()):
+        if bool(entry.get("candidate", False)):
+            candidates.append(
+                CandidateBlock(
+                    height=height,
+                    header_hash=entry.get("header_hash") if isinstance(entry.get("header_hash"), str) else None,
+                    total_block_fee_mojo=int(entry.get("total_block_fee_mojo", 0)),
+                )
+            )
     scanned = 0
-    for start, end in iter_height_ranges(start_height, peak_height, chunk_size):
+    for start, end in iter_uncached_height_ranges(
+        start_height,
+        end_height_exclusive,
+        chunk_size,
+        cached_heights_in_window,
+    ):
         payload = {
             "start": start,
             "end": end,
@@ -334,23 +473,52 @@ def collect_candidate_blocks(
         blocks = data.get("blocks", [])
         scanned += len(blocks)
         for block in blocks:
+            height = block_height(block)
             if not block_is_transaction_block(block):
+                phase1_cache_by_height[height] = {
+                    "candidate": False,
+                    "header_hash": None,
+                    "total_block_fee_mojo": 0,
+                }
                 continue
             if not block_has_transactions(block):
+                phase1_cache_by_height[height] = {
+                    "candidate": False,
+                    "header_hash": None,
+                    "total_block_fee_mojo": 0,
+                }
                 continue
             fee = block_total_fee(block)
-            if fee == 0:
+            if fee <= 0:
+                phase1_cache_by_height[height] = {
+                    "candidate": False,
+                    "header_hash": None,
+                    "total_block_fee_mojo": 0,
+                }
                 continue
+            header_hash = block_header_hash(block)
+            phase1_cache_by_height[height] = {
+                "candidate": True,
+                "header_hash": header_hash,
+                "total_block_fee_mojo": fee,
+            }
             candidates.append(
                 CandidateBlock(
-                    height=block_height(block),
-                    header_hash=block_header_hash(block),
+                    height=height,
+                    header_hash=header_hash,
+                    total_block_fee_mojo=fee,
                 )
             )
         if sleep_between_chunks > 0:
             time.sleep(sleep_between_chunks)
 
-    return candidates, scanned, peak_height
+    return (
+        candidates,
+        scanned,
+        peak_height,
+        phase1_cache_by_height,
+        len(cached_heights_in_window),
+    )
 
 
 def classify_failure_reason(exc: Exception) -> str:
@@ -375,6 +543,9 @@ def collect_block_fees(
     timeout: int,
     candidates: list[CandidateBlock],
     max_workers: int,
+    min_spends_per_block: int | None = None,
+    max_spends_per_block: int | None = None,
+    min_estimated_fee_per_tx_mojo: int = DEFAULT_MIN_ESTIMATED_FEE_PER_TX_MOJO,
 ) -> tuple[list[BlockFeeRow], dict[str, int], list[SkippedBlockRow]]:
     # Phase 2: deep inspection for each candidate block in parallel.
     rows: list[BlockFeeRow] = []
@@ -382,7 +553,15 @@ def collect_block_fees(
     skipped_blocks: list[SkippedBlockRow] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures: dict[concurrent.futures.Future[BlockFeeRow | None], CandidateBlock] = {
-            pool.submit(inspect_block_spends, base_url, timeout, candidate): candidate
+            pool.submit(
+                inspect_block_spends,
+                base_url,
+                timeout,
+                candidate,
+                min_spends_per_block,
+                max_spends_per_block,
+                min_estimated_fee_per_tx_mojo,
+            ): candidate
             for candidate in candidates
         }
         for future in concurrent.futures.as_completed(futures):
@@ -400,7 +579,7 @@ def collect_block_fees(
                 rows.append(row)
             else:
                 skipped_blocks.append(
-                    SkippedBlockRow(height=candidate.height, reason="zero_fee_spend")
+                    SkippedBlockRow(height=candidate.height, reason="no_usable_spend_fee")
                 )
     return rows, failure_counts, skipped_blocks
 
@@ -414,6 +593,8 @@ def write_csv(rows: list[BlockFeeRow], output_csv: Path) -> None:
                 "block_height",
                 "min_spend_fee_mojo",
                 "spend_count",
+                "block_total_fee_mojo",
+                "estimated_fee_per_tx_mojo",
             ]
         )
         for row in rows:
@@ -422,6 +603,8 @@ def write_csv(rows: list[BlockFeeRow], output_csv: Path) -> None:
                     row.height,
                     row.min_spend_fee_mojo,
                     row.spend_count,
+                    row.block_total_fee_mojo,
+                    row.estimated_fee_per_tx_mojo,
                 ]
             )
 
@@ -448,11 +631,12 @@ def parse_args() -> argparse.Namespace:
         add_help=False,
         description=(
             "Scan recent Chia transaction blocks via Coinset and measure\n"
-            "the minimum per-spend fee floor among qualifying blocks.\n"
-            "Excludes: non-tx blocks, tx blocks with no txs, tx blocks with\n"
-            "zero total block fee, and any tx block with a zero-fee spend.\n"
+            "a naive fee-per-tx proxy among qualifying blocks.\n"
+            "Excludes: non-tx blocks, tx blocks with no txs, and tx blocks with\n"
+            "zero total block fee.\n"
             "Always writes a CSV file for the run.\n"
-            "CSV columns: block_height, min_spend_fee_mojo, spend_count."
+            "CSV columns: block_height, min_spend_fee_mojo, spend_count,\n"
+            "block_total_fee_mojo, estimated_fee_per_tx_mojo."
         ),
         epilog=(
             "Examples:\n"
@@ -527,6 +711,49 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_WORKERS,
         help=f"Parallel workers for per-block spend inspection. Default: {DEFAULT_MAX_WORKERS}",
     )
+    parser.add_argument(
+        "--min-estimated-fee-per-tx-mojo",
+        type=int,
+        default=DEFAULT_MIN_ESTIMATED_FEE_PER_TX_MOJO,
+        help=(
+            "Reject a block if calculated naive fee-per-tx is below this threshold.\n"
+            "Default: 1000 mojos. Rationale: very low naive values can occur\n"
+            "naturally and are weak evidence of an enforced fee floor."
+        ),
+    )
+    parser.add_argument(
+        "--min-spends-per-block",
+        type=int,
+        default=None,
+        help=(
+            "Optional lower bound for spends per block (used as temporary tx-count proxy).\n"
+            "Default: none. Example: 1 spend"
+        ),
+    )
+    parser.add_argument(
+        "--max-spends-per-block",
+        type=int,
+        default=None,
+        help=(
+            "Optional upper bound for spends per block (used as temporary tx-count proxy).\n"
+            "Default: none. Example: 3 spends"
+        ),
+    )
+    parser.add_argument(
+        "--negative-cache-path",
+        metavar="PATH",
+        default=DEFAULT_NEGATIVE_CACHE_PATH,
+        help=(
+            "Path to phase-1 cache by block height (candidate vs non-candidate).\n"
+            "Default: "
+            f"{DEFAULT_NEGATIVE_CACHE_PATH}"
+        ),
+    )
+    parser.add_argument(
+        "--no-negative-cache",
+        action="store_true",
+        help="Disable negative-cache reads/writes for this run.",
+    )
     return parser.parse_args()
 
 
@@ -541,8 +768,29 @@ def main() -> int:
     if args.max_workers <= 0:
         print("--max-workers must be > 0", file=sys.stderr)
         return 2
+    if args.min_estimated_fee_per_tx_mojo < 0:
+        print("--min-estimated-fee-per-tx-mojo must be >= 0", file=sys.stderr)
+        return 2
+    if args.min_spends_per_block is not None and args.min_spends_per_block <= 0:
+        print("--min-spends-per-block must be > 0", file=sys.stderr)
+        return 2
+    if args.max_spends_per_block is not None and args.max_spends_per_block <= 0:
+        print("--max-spends-per-block must be > 0", file=sys.stderr)
+        return 2
+    if (
+        args.min_spends_per_block is not None
+        and args.max_spends_per_block is not None
+        and args.min_spends_per_block > args.max_spends_per_block
+    ):
+        print("--min-spends-per-block cannot be greater than --max-spends-per-block", file=sys.stderr)
+        return 2
 
     run_started_at = time.time()
+    negative_cache_enabled = not args.no_negative_cache
+    cache_path = Path(args.negative_cache_path)
+    phase1_cache_by_height = (
+        load_phase1_cache(cache_path, args.base_url) if negative_cache_enabled else {}
+    )
 
     # Two-pass pipeline:
     # 1) Candidate filtering by block metadata.
@@ -550,19 +798,35 @@ def main() -> int:
     dot_ticker = ProgressDotTicker()
     dot_ticker.start()
     try:
-        candidates, scanned_count, peak_height = collect_candidate_blocks(
+        (
+            candidates,
+            scanned_count,
+            peak_height,
+            updated_phase1_cache_by_height,
+            cached_heights_in_window_count,
+        ) = collect_candidate_blocks(
             base_url=args.base_url,
             days=args.days,
             chunk_size=args.chunk_size,
             timeout=args.timeout,
             sleep_between_chunks=args.sleep_between_chunks,
+            phase1_cache_by_height=phase1_cache_by_height if negative_cache_enabled else None,
         )
+        newly_cached_phase1_count = 0
+        if negative_cache_enabled:
+            before_count = len(phase1_cache_by_height)
+            phase1_cache_by_height = updated_phase1_cache_by_height
+            newly_cached_phase1_count = max(0, len(phase1_cache_by_height) - before_count)
+            save_phase1_cache(cache_path, args.base_url, phase1_cache_by_height)
 
         rows, failure_counts, skipped_blocks = collect_block_fees(
             base_url=args.base_url,
             timeout=args.timeout,
             candidates=candidates,
             max_workers=args.max_workers,
+            min_spends_per_block=args.min_spends_per_block,
+            max_spends_per_block=args.max_spends_per_block,
+            min_estimated_fee_per_tx_mojo=args.min_estimated_fee_per_tx_mojo,
         )
     finally:
         dot_ticker.stop()
@@ -580,6 +844,10 @@ def main() -> int:
     print(f"- Candidate tx blocks (non-zero block fee): {len(candidates)}")
     print(f"- Qualifying tx blocks: {len(rows)}")
     print(f"- Skipped candidate tx blocks: {len(skipped_blocks)}")
+    if negative_cache_enabled:
+        print(f"- Negative cache path: {cache_path}")
+        print(f"- Cached heights in window (phase 1): {cached_heights_in_window_count}")
+        print(f"- Newly cached heights (phase 1): {newly_cached_phase1_count}")
     if failure_counts:
         failure_parts = [f"{name}={count}" for name, count in sorted(failure_counts.items())]
         print(f"- Skipped due to phase-2 errors: {', '.join(failure_parts)}")
@@ -587,11 +855,11 @@ def main() -> int:
     if args.skipped_csv:
         print(f"- Wrote skipped CSV: {args.skipped_csv}")
     if rows:
-        min_row = min(rows, key=lambda r: r.min_spend_fee_mojo)
-        min_xch = mojo_to_xch(min_row.min_spend_fee_mojo)
+        min_row = min(rows, key=lambda r: r.estimated_fee_per_tx_mojo)
+        min_xch = min_row.estimated_fee_per_tx_mojo / MOJO_PER_XCH
         print(
-            "- Lowest per-spend fee floor: "
-            f"{min_row.min_spend_fee_mojo} mojo ({format_xch(min_xch)} XCH) "
+            "- Lowest naive fee per tx proxy (block_total_fee/spend_count): "
+            f"{min_row.estimated_fee_per_tx_mojo} mojo ({format_xch(min_xch)} XCH) "
             f"at height {min_row.height}"
         )
     else:
@@ -608,6 +876,20 @@ def main() -> int:
             "chunk_size": args.chunk_size,
             "timeout_seconds": args.timeout,
             "max_workers": args.max_workers,
+            "min_estimated_fee_per_tx_mojo_threshold": args.min_estimated_fee_per_tx_mojo,
+            "min_spends_per_block": args.min_spends_per_block,
+            "max_spends_per_block": args.max_spends_per_block,
+            "negative_cache_enabled": negative_cache_enabled,
+            "negative_cache_path": str(cache_path),
+            "cached_heights_in_window_phase1": (
+                cached_heights_in_window_count if negative_cache_enabled else 0
+            ),
+            "newly_cached_heights_phase1": (
+                newly_cached_phase1_count if negative_cache_enabled else 0
+            ),
+            "cached_heights_total_phase1": (
+                len(phase1_cache_by_height) if negative_cache_enabled else 0
+            ),
             "sleep_between_chunks_seconds": args.sleep_between_chunks,
             "peak_height": peak_height,
             "scanned_blocks": scanned_count,
@@ -620,10 +902,14 @@ def main() -> int:
             "elapsed_seconds": round(time.time() - run_started_at, 3),
         }
         if min_row is not None:
-            summary["lowest_per_spend_fee"] = {
+            summary["lowest_naive_fee_per_tx_proxy"] = {
                 "block_height": min_row.height,
-                "min_spend_fee_mojo": min_row.min_spend_fee_mojo,
-                "min_spend_fee_xch": format_xch(mojo_to_xch(min_row.min_spend_fee_mojo)),
+                "spend_count_proxy": min_row.spend_count,
+                "block_total_fee_mojo": min_row.block_total_fee_mojo,
+                "estimated_fee_per_tx_mojo": min_row.estimated_fee_per_tx_mojo,
+                "estimated_fee_per_tx_xch": format_xch(
+                    min_row.estimated_fee_per_tx_mojo / MOJO_PER_XCH
+                ),
             }
         write_summary_json(summary, Path(args.summary_json))
         print(f"- Wrote summary JSON: {args.summary_json}")

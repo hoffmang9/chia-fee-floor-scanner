@@ -6,17 +6,22 @@ This file provides project-specific context for coding agents working in this re
 
 - Purpose: measure an observed Chia transaction fee floor from Coinset block data.
 - Main script: `min_tx_fee_scan.py`.
-- Primary output: CSV with per-block minimum per-spend fee for qualifying blocks.
+- Primary output: CSV with per-block naive fee-per-tx proxy for qualifying blocks.
 
 ## Policy and behavior
 
 - Candidate blocks are transaction blocks with non-zero total block fee.
-- A candidate block is excluded if any spend has zero fee.
+- Qualifying metric is naive: `estimated_fee_per_tx_mojo = block_total_fee_mojo / spend_count`.
+- Default threshold: reject blocks where estimated fee-per-tx is below `1000` mojos
+  (`--min-estimated-fee-per-tx-mojo`).
 - Per-spend fee is estimated as:
   - `coin_spend.coin.amount - sum(CREATE_COIN amounts)`
 - Spend-level data source is Coinset `block_spends_with_conditions`.
-- Script is fail-soft on phase-2 per-block errors, but now reports skipped counts
-  and optional skipped details via `--skipped-csv`.
+- Script is fail-soft on phase-2 per-block errors and reports skipped counts/details
+  via `--skipped-csv`.
+- Cache behavior: phase-1-by-height cache (`--negative-cache-path`) stores candidate
+  vs non-candidate classification to avoid repeated `/get_blocks` calls; phase-2
+  outcomes are recomputed each run.
 
 ## Key files
 
@@ -45,5 +50,5 @@ This file provides project-specific context for coding agents working in this re
 
 - Prefer `python3` in commands.
 - Keep README language user-facing and consistent with implementation.
-- Keep policy wording precise: "zero-fee spend excludes the block."
+- Keep policy wording precise: "naive fee-per-tx threshold filtering."
 - Avoid introducing third-party dependencies unless explicitly requested.
