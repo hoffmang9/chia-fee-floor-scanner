@@ -1,0 +1,17 @@
+{
+  "block_spends_with_conditions": [
+    {
+      "coin_spend": {
+        "coin": {
+          "amount": 100
+        }
+      },
+      "conditions": [
+        {
+          "opcode": 51,
+          "vars": ["0xaaa", 100]
+        }
+      ]
+    }
+  ]
+}

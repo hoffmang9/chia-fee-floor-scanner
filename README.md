@@ -93,6 +93,7 @@ and the number of candidate blocks in the selected window.
 - `--max-workers`: `8`
 - `--output-csv`: auto-generated when omitted
 - `--skipped-csv`: disabled by default
+- `--summary-json`: disabled by default
 
 If `--output-csv` is omitted, output defaults to
 `min_tx_fee_blocks_<days>day.csv`, for example:
@@ -174,6 +175,9 @@ If `--skipped-csv` is provided, a second CSV is written with:
 - `block_height`
 - `reason` (`zero_fee_spend`, `network_error`, `http_error`, etc.)
 
+If `--summary-json` is provided, a JSON file is written with run metadata,
+aggregate counters, skipped reason counts, and minimum fee summary.
+
 ## Tests
 
 Run the test suite:
@@ -181,6 +185,9 @@ Run the test suite:
 ```bash
 python3 -m unittest discover -s tests -p "test_*.py"
 ```
+
+Fixture-based regression tests live under `tests/fixtures/` and validate parsing
+and candidate filtering behavior against representative Coinset response shapes.
 
 ## See also
 

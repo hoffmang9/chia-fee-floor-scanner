@@ -1,7 +1,17 @@
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import min_tx_fee_scan as scanner
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def load_fixture(name: str) -> dict:
+    with (FIXTURES_DIR / name).open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 class ParseMojoTests(unittest.TestCase):
@@ -110,6 +120,69 @@ class CollectBlockFeesTests(unittest.TestCase):
         self.assertEqual(len(skipped), 2)
         reasons = sorted(item.reason for item in skipped)
         self.assertEqual(reasons, ["network_error", "zero_fee_spend"])
+
+
+class FixtureRegressionTests(unittest.TestCase):
+    @patch("min_tx_fee_scan.get_peak_and_avg_block_time")
+    @patch("min_tx_fee_scan.post_json")
+    def test_collect_candidate_blocks_from_fixture(self, mock_post_json, mock_peak) -> None:
+        mock_peak.return_value = (1003, 20.0)
+        mock_post_json.return_value = load_fixture("get_blocks_response.json")
+
+        candidates, scanned, peak_height = scanner.collect_candidate_blocks(
+            base_url="https://api.coinset.org",
+            days=0.0001,  # 1 block lookback with avg block time 20s
+            chunk_size=100,
+            timeout=30,
+            sleep_between_chunks=0.0,
+        )
+
+        self.assertEqual(peak_height, 1003)
+        self.assertEqual(scanned, 4)
+        self.assertEqual([c.height for c in candidates], [1002, 1003])
+        self.assertEqual([c.header_hash for c in candidates], ["0xheader1002", "0xheader1003"])
+
+    @patch("min_tx_fee_scan.post_json")
+    def test_inspect_block_spends_from_positive_fixture(self, mock_post_json) -> None:
+        mock_post_json.return_value = load_fixture("block_spends_positive.json")
+        candidate = scanner.CandidateBlock(height=1002, header_hash="0xheader1002")
+
+        row = scanner.inspect_block_spends(
+            base_url="https://api.coinset.org",
+            timeout=30,
+            candidate=candidate,
+        )
+
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row.min_spend_fee_mojo, 30)
+        self.assertEqual(row.spend_count, 2)
+
+    @patch("min_tx_fee_scan.post_json")
+    def test_inspect_block_spends_from_zero_fee_fixture(self, mock_post_json) -> None:
+        mock_post_json.return_value = load_fixture("block_spends_zero_fee.json")
+        candidate = scanner.CandidateBlock(height=1001, header_hash="0xheader1001")
+
+        row = scanner.inspect_block_spends(
+            base_url="https://api.coinset.org",
+            timeout=30,
+            candidate=candidate,
+        )
+        self.assertIsNone(row)
+
+    def test_write_summary_json(self) -> None:
+        summary = {
+            "qualifying_tx_blocks": 2,
+            "skipped_reasons": {"zero_fee_spend": 1},
+            "lowest_per_spend_fee": {"min_spend_fee_mojo": 10000},
+        }
+        with TemporaryDirectory() as tmp_dir:
+            out = Path(tmp_dir) / "run_summary.json"
+            scanner.write_summary_json(summary, out)
+            loaded = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(loaded["qualifying_tx_blocks"], 2)
+        self.assertEqual(loaded["skipped_reasons"]["zero_fee_spend"], 1)
+        self.assertEqual(loaded["lowest_per_spend_fee"]["min_spend_fee_mojo"], 10000)
 
 
 if __name__ == "__main__":

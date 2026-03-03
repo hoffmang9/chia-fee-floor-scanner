@@ -435,6 +435,13 @@ def write_skipped_csv(rows: list[SkippedBlockRow], output_csv: Path) -> None:
             writer.writerow([row.height, row.reason])
 
 
+def write_summary_json(summary: dict[str, Any], output_json: Path) -> None:
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    with output_json.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="min_tx_fee_scan.py",
@@ -506,6 +513,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--summary-json",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Optional JSON path for run metadata and aggregate counters.\n"
+            "Includes scan counts, skipped reasons, and minimum fee summary."
+        ),
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=DEFAULT_MAX_WORKERS,
@@ -525,6 +541,8 @@ def main() -> int:
     if args.max_workers <= 0:
         print("--max-workers must be > 0", file=sys.stderr)
         return 2
+
+    run_started_at = time.time()
 
     # Two-pass pipeline:
     # 1) Candidate filtering by block metadata.
@@ -577,7 +595,38 @@ def main() -> int:
             f"at height {min_row.height}"
         )
     else:
+        min_row = None
         print("- No qualifying blocks found in the selected window.")
+
+    if args.summary_json:
+        skipped_reason_counts: dict[str, int] = {}
+        for skipped in skipped_blocks:
+            skipped_reason_counts[skipped.reason] = skipped_reason_counts.get(skipped.reason, 0) + 1
+        summary = {
+            "base_url": args.base_url,
+            "days": args.days,
+            "chunk_size": args.chunk_size,
+            "timeout_seconds": args.timeout,
+            "max_workers": args.max_workers,
+            "sleep_between_chunks_seconds": args.sleep_between_chunks,
+            "peak_height": peak_height,
+            "scanned_blocks": scanned_count,
+            "candidate_tx_blocks_non_zero_fee": len(candidates),
+            "qualifying_tx_blocks": len(rows),
+            "skipped_candidate_blocks": len(skipped_blocks),
+            "skipped_reasons": dict(sorted(skipped_reason_counts.items())),
+            "output_csv": str(output_csv),
+            "skipped_csv": args.skipped_csv,
+            "elapsed_seconds": round(time.time() - run_started_at, 3),
+        }
+        if min_row is not None:
+            summary["lowest_per_spend_fee"] = {
+                "block_height": min_row.height,
+                "min_spend_fee_mojo": min_row.min_spend_fee_mojo,
+                "min_spend_fee_xch": format_xch(mojo_to_xch(min_row.min_spend_fee_mojo)),
+            }
+        write_summary_json(summary, Path(args.summary_json))
+        print(f"- Wrote summary JSON: {args.summary_json}")
     return 0
 
 

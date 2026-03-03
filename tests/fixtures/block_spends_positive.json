@@ -1,0 +1,30 @@
+{
+  "block_spends_with_conditions": [
+    {
+      "coin_spend": {
+        "coin": {
+          "amount": "0x64"
+        }
+      },
+      "conditions": [
+        {
+          "opcode": 51,
+          "vars": ["0xaaa", "0x46"]
+        }
+      ]
+    },
+    {
+      "coin_spend": {
+        "coin": {
+          "amount": 200
+        }
+      },
+      "conditions": [
+        {
+          "opcode": "0x33",
+          "vars": ["0xbbb", 170]
+        }
+      ]
+    }
+  ]
+}
