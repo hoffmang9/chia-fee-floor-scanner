@@ -1,0 +1,46 @@
+{
+  "blocks": [
+    {
+      "reward_chain_block": {
+        "height": 1000,
+        "is_transaction_block": false
+      },
+      "transactions_generator": null,
+      "transactions_info": {
+        "fees": 0
+      }
+    },
+    {
+      "reward_chain_block": {
+        "height": 1001,
+        "is_transaction_block": true
+      },
+      "transactions_generator": "0xabc1",
+      "transactions_info": {
+        "fees": 0
+      }
+    },
+    {
+      "reward_chain_block": {
+        "height": 1002,
+        "is_transaction_block": true
+      },
+      "transactions_generator": "0xabc2",
+      "transactions_info": {
+        "fees": 15000
+      },
+      "header_hash": "0xheader1002"
+    },
+    {
+      "reward_chain_block": {
+        "height": 1003,
+        "is_transaction_block": true
+      },
+      "transactions_generator": "0xabc3",
+      "transactions_info": {
+        "fees": "20000"
+      },
+      "header_hash": "0xheader1003"
+    }
+  ]
+}
