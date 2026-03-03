@@ -1,0 +1,43 @@
+venv/
+.venv/
+*.csv
+!examples/min_tx_fee_blocks_sample.csv
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments (alternate names)
+env/
+ENV/
+
+# Environment variables / local config
+.env
+.env.*
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
