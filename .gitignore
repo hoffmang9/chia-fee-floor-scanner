@@ -2,6 +2,8 @@ venv/
 .venv/
 *.csv
 !examples/min_tx_fee_blocks_sample.csv
+*.json
+!tests/fixtures/*.json
 
 # Python bytecode and caches
 __pycache__/
@@ -41,3 +43,6 @@ ENV/
 .DS_Store
 .vscode/
 .idea/
+
+# Local cache files
+.cache/

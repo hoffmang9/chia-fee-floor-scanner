@@ -84,12 +84,32 @@ class InspectBlockTests(unittest.TestCase):
             base_url="https://api.coinset.org",
             timeout=30,
             candidate=candidate,
+            min_estimated_fee_per_tx_mojo=0,
         )
         self.assertIsNotNone(row)
         assert row is not None
         self.assertEqual(row.height, 124)
         self.assertEqual(row.min_spend_fee_mojo, 20)
         self.assertEqual(row.spend_count, 2)
+
+    @patch("min_tx_fee_scan.post_json")
+    def test_inspect_block_spends_applies_min_estimated_fee_threshold(self, mock_post_json) -> None:
+        mock_post_json.return_value = {
+            "block_spends_with_conditions": [
+                {
+                    "coin_spend": {"coin": {"amount": 100}},
+                    "conditions": [{"opcode": 51, "vars": ["0xabc", 99]}],  # fee 1
+                }
+            ]
+        }
+        candidate = scanner.CandidateBlock(height=125, header_hash="0x125", total_block_fee_mojo=1)
+        row = scanner.inspect_block_spends(
+            base_url="https://api.coinset.org",
+            timeout=30,
+            candidate=candidate,
+            min_estimated_fee_per_tx_mojo=2,
+        )
+        self.assertIsNone(row)
 
 
 class CollectBlockFeesTests(unittest.TestCase):
@@ -119,7 +139,7 @@ class CollectBlockFeesTests(unittest.TestCase):
         self.assertEqual(failure_counts.get("network_error"), 1)
         self.assertEqual(len(skipped), 2)
         reasons = sorted(item.reason for item in skipped)
-        self.assertEqual(reasons, ["network_error", "zero_fee_spend"])
+        self.assertEqual(reasons, ["network_error", "no_usable_spend_fee"])
 
 
 class FixtureRegressionTests(unittest.TestCase):
@@ -129,7 +149,7 @@ class FixtureRegressionTests(unittest.TestCase):
         mock_peak.return_value = (1003, 20.0)
         mock_post_json.return_value = load_fixture("get_blocks_response.json")
 
-        candidates, scanned, peak_height = scanner.collect_candidate_blocks(
+        candidates, scanned, peak_height, updated_phase1_cache, cached_in_window = scanner.collect_candidate_blocks(
             base_url="https://api.coinset.org",
             days=0.0001,  # 1 block lookback with avg block time 20s
             chunk_size=100,
@@ -141,6 +161,21 @@ class FixtureRegressionTests(unittest.TestCase):
         self.assertEqual(scanned, 4)
         self.assertEqual([c.height for c in candidates], [1002, 1003])
         self.assertEqual([c.header_hash for c in candidates], ["0xheader1002", "0xheader1003"])
+        self.assertEqual(cached_in_window, 0)
+        self.assertEqual(updated_phase1_cache[1000]["candidate"], False)
+        self.assertEqual(updated_phase1_cache[1001]["candidate"], False)
+        self.assertEqual(updated_phase1_cache[1002]["candidate"], True)
+
+    def test_iter_uncached_height_ranges_skips_excluded_heights(self) -> None:
+        ranges = list(
+            scanner.iter_uncached_height_ranges(
+                start=10,
+                end=20,
+                chunk_size=4,
+                excluded_heights={12, 13, 18},
+            )
+        )
+        self.assertEqual(ranges, [(10, 12), (14, 18), (19, 20)])
 
     @patch("min_tx_fee_scan.post_json")
     def test_inspect_block_spends_from_positive_fixture(self, mock_post_json) -> None:
@@ -151,6 +186,7 @@ class FixtureRegressionTests(unittest.TestCase):
             base_url="https://api.coinset.org",
             timeout=30,
             candidate=candidate,
+            min_estimated_fee_per_tx_mojo=0,
         )
 
         self.assertIsNotNone(row)
@@ -173,7 +209,7 @@ class FixtureRegressionTests(unittest.TestCase):
     def test_write_summary_json(self) -> None:
         summary = {
             "qualifying_tx_blocks": 2,
-            "skipped_reasons": {"zero_fee_spend": 1},
+            "skipped_reasons": {"no_usable_spend_fee": 1},
             "lowest_per_spend_fee": {"min_spend_fee_mojo": 10000},
         }
         with TemporaryDirectory() as tmp_dir:
@@ -181,7 +217,7 @@ class FixtureRegressionTests(unittest.TestCase):
             scanner.write_summary_json(summary, out)
             loaded = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(loaded["qualifying_tx_blocks"], 2)
-        self.assertEqual(loaded["skipped_reasons"]["zero_fee_spend"], 1)
+        self.assertEqual(loaded["skipped_reasons"]["no_usable_spend_fee"], 1)
         self.assertEqual(loaded["lowest_per_spend_fee"]["min_spend_fee_mojo"], 10000)
 
 
